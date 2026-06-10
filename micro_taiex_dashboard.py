@@ -96,17 +96,25 @@ class MicroTaiexDashboard:
         self._latest_bid_volume: Any = ""
         self._latest_ask_price: Any = ""
         self._latest_ask_volume: Any = ""
+        self._callback_refs: dict[str, Any] = {}
+        self._subscription_errors: list[str] = []
         self._widgets: dict[str, Any] = {}
 
     def start(self, display_ui: bool = True) -> "MicroTaiexDashboard":
         """Register callbacks, subscribe quotes, and optionally display widgets."""
 
-        self._register_callbacks()
-        for quote_type in self.quote_types:
-            self.api.subscribe(self.contract, quote_type=subscribe_quote_arg(quote_type))
-
         if display_ui:
             self._display_widgets()
+
+        self._register_callbacks()
+        for quote_type in self.quote_types:
+            try:
+                self.api.subscribe(self.contract, quote_type=subscribe_quote_arg(quote_type))
+            except Exception as exc:  # noqa: BLE001 - surface all subscription failures in the UI
+                self._subscription_errors.append(f"{quote_type}: {exc}")
+
+        if display_ui:
+            self._render_subscription_status()
             self._ui_thread = threading.Thread(target=self._refresh_loop, daemon=True)
             self._ui_thread.start()
         return self
@@ -120,6 +128,14 @@ class MicroTaiexDashboard:
                 self.api.unsubscribe(self.contract, quote_type=subscribe_quote_arg(quote_type))
             except Exception as exc:  # noqa: BLE001 - best effort cleanup
                 print(f"unsubscribe {quote_type} failed: {exc}", file=sys.stderr)
+        for quote_type in self.quote_types:
+            clear_name = callback_clear_method_name(quote_type)
+            clear_callback = getattr(self.api, clear_name, None)
+            if clear_callback is not None:
+                try:
+                    clear_callback()
+                except Exception as exc:  # noqa: BLE001 - best effort cleanup
+                    print(f"clear {quote_type} callback failed: {exc}", file=sys.stderr)
         try:
             self.api.logout()
         except Exception as exc:  # noqa: BLE001 - best effort cleanup
@@ -139,26 +155,28 @@ class MicroTaiexDashboard:
             self.stop()
 
     def _register_callbacks(self) -> None:
-        if "Tick" in self.quote_types:
-            decorator = getattr(self.api, "on_tick_fop_v1", None)
-            if decorator is not None:
-                @decorator()
-                def on_tick(_exchange: Any, tick: Any) -> None:
-                    self._handle_quote("tick", tick)
+        """Register persistent Shioaji callbacks for the selected FOP quote streams."""
 
-        if "BidAsk" in self.quote_types:
-            decorator = getattr(self.api, "on_bidask_fop_v1", None)
-            if decorator is not None:
-                @decorator()
-                def on_bidask(_exchange: Any, bidask: Any) -> None:
-                    self._handle_quote("bid_ask", bidask)
+        callback_specs = {
+            "Tick": ("set_on_tick_fop_v1_callback", "on_tick_fop_v1", "tick"),
+            "BidAsk": ("set_on_bidask_fop_v1_callback", "on_bidask_fop_v1", "bid_ask"),
+            "Quote": ("set_on_quote_fop_v1_callback", "on_quote_fop_v1", "quote"),
+        }
+        for canonical_quote_type in self.quote_types:
+            setter_name, decorator_name, event_type = callback_specs[canonical_quote_type]
 
-        if "Quote" in self.quote_types:
-            decorator = getattr(self.api, "on_quote_fop_v1", None)
+            def callback(_exchange: Any, payload: Any, event_type: str = event_type) -> None:
+                self._handle_quote(event_type, payload)
+
+            self._callback_refs[canonical_quote_type] = callback
+            setter = getattr(self.api, setter_name, None)
+            if setter is not None:
+                setter(callback)
+                continue
+
+            decorator = getattr(self.api, decorator_name, None)
             if decorator is not None:
-                @decorator()
-                def on_quote(_exchange: Any, quote: Any) -> None:
-                    self._handle_quote("quote", quote)
+                decorator()(callback)
 
     def _handle_quote(self, quote_type: str, payload: Any) -> None:
         record = normalize_quote_payload(quote_type, payload)
@@ -212,6 +230,23 @@ class MicroTaiexDashboard:
             }
         )
         display(box)
+
+    def _render_subscription_status(self) -> None:
+        if not self._widgets:
+            return
+        contract_code = getattr(self.contract, "code", "") or str(self.contract)
+        if self._subscription_errors:
+            self._widgets["status"].value = (
+                "<b>狀態：</b>訂閱失敗　"
+                f"契約：{html.escape(str(contract_code))}　"
+                f"錯誤：{html.escape('; '.join(self._subscription_errors))}"
+            )
+            return
+        self._widgets["status"].value = (
+            "<b>狀態：</b>已訂閱，等待第一筆報價...　"
+            f"契約：{html.escape(str(contract_code))}　"
+            f"訂閱：{html.escape(', '.join(self.quote_types))}"
+        )
 
     def _refresh_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -404,10 +439,24 @@ def list_product_contracts(api: Any, product: str = "TMF", print_result: bool = 
     return codes
 
 
-def subscribe_quote_arg(canonical_quote_type: str) -> str:
-    """Return the string value accepted by Shioaji's subscribe API."""
+def callback_clear_method_name(canonical_quote_type: str) -> str:
+    """Return the Shioaji callback clear method for a canonical FOP quote type."""
 
-    return {"Tick": "tick", "BidAsk": "bid_ask", "Quote": "quote"}[canonical_quote_type]
+    return {
+        "Tick": "clear_on_tick_fop_v1_callback",
+        "BidAsk": "clear_on_bidask_fop_v1_callback",
+        "Quote": "clear_on_quote_fop_v1_callback",
+    }[canonical_quote_type]
+
+
+def subscribe_quote_arg(canonical_quote_type: str) -> Any:
+    """Return the quote type accepted by Shioaji's subscribe API."""
+
+    try:
+        import shioaji as sj
+    except ImportError:
+        return {"Tick": "tick", "BidAsk": "bid_ask", "Quote": "quote"}[canonical_quote_type]
+    return {"Tick": sj.QuoteType.Tick, "BidAsk": sj.QuoteType.BidAsk, "Quote": sj.QuoteType.Quote}[canonical_quote_type]
 
 
 def normalize_quote_type(quote_type: str) -> str:
