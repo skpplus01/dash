@@ -4,6 +4,24 @@
 
 > ⚠️ 僅供行情顯示與程式範例使用，不含下單功能，也不構成投資建議。永豐即時報價只會在期交所交易時段推送。
 
+## 需要登入 API 嗎？
+
+需要。Shioaji 目前以 **API Key + Secret Key** 登入；你有 API Key 之後，還需要建立時取得的 Secret Key 才能完成 `api.login(...)`。這個專案不會要求券商帳號密碼，也不會啟用憑證或下單功能。
+
+在 Colab 建議用隱藏輸入，不要把 KEY 寫死在 Notebook：
+
+```python
+from micro_taiex_dashboard import run_colab_dashboard
+
+dashboard = run_colab_dashboard(
+    contract_code="TMFR1",
+    quote_types=("tick", "bid_ask"),
+    simulation=True,
+)
+```
+
+執行後會依序詢問 `永豐 API Key` 與 `永豐 Secret Key`。如果你想手動傳入，也可以使用 `run_colab_dashboard(api_key="...", secret_key="...")`。
+
 ## 功能
 
 - 使用永豐 Shioaji API 登入並訂閱期貨即時報價。
@@ -27,15 +45,10 @@
 3. 下載或上傳本專案的 `micro_taiex_dashboard.py`，然後執行：
 
 ```python
-from getpass import getpass
 from micro_taiex_dashboard import run_colab_dashboard
 
-api_key = getpass("Sinopac API Key: ")
-secret_key = getpass("Sinopac Secret Key: ")
-
+# 會用隱藏輸入詢問永豐 API Key 與 Secret Key；不要把 KEY 寫死在 Notebook。
 dashboard = run_colab_dashboard(
-    api_key=api_key,
-    secret_key=secret_key,
     contract_code="TMFR1",   # 微型臺指近月連續契約；也可填 TMF202606 等月份契約
     quote_types=("tick", "bid_ask"),
     simulation=True,
@@ -51,8 +64,8 @@ dashboard.stop()
 ## 本機 / 終端機執行
 
 ```bash
-export SINOPAC_API_KEY="你的 API key"
-export SINOPAC_SECRET_KEY="你的 Secret key"
+export SINOPAC_API_KEY="你的 API key"      # 或使用 SJ_API_KEY
+export SINOPAC_SECRET_KEY="你的 Secret key"  # 或使用 SJ_SEC_KEY
 python micro_taiex_dashboard.py --contract TMFR1 --quote-type tick --quote-type bid_ask
 ```
 

@@ -233,7 +233,10 @@ class MicroTaiexDashboard:
 
 
 def login_api(api_key: str, secret_key: str, simulation: bool = True, fetch_contract: bool = True) -> Any:
-    """Create and login a Shioaji API instance."""
+    """Create and login a Shioaji API instance with API Key and Secret Key."""
+
+    if not api_key or not secret_key:
+        raise ValueError("Shioaji login requires both api_key and secret_key.")
 
     import shioaji as sj
 
@@ -242,18 +245,36 @@ def login_api(api_key: str, secret_key: str, simulation: bool = True, fetch_cont
     return api
 
 
+def prompt_for_shioaji_credentials(api_key: str | None = None, secret_key: str | None = None) -> tuple[str, str]:
+    """Read Shioaji credentials from arguments, environment variables, or hidden prompts."""
+
+    from getpass import getpass
+
+    resolved_api_key = api_key or os.environ.get("SINOPAC_API_KEY") or os.environ.get("SJ_API_KEY")
+    resolved_secret_key = secret_key or os.environ.get("SINOPAC_SECRET_KEY") or os.environ.get("SJ_SEC_KEY")
+
+    if not resolved_api_key:
+        resolved_api_key = getpass("永豐 API Key: ")
+    if not resolved_secret_key:
+        resolved_secret_key = getpass("永豐 Secret Key: ")
+    if not resolved_api_key or not resolved_secret_key:
+        raise ValueError("請提供永豐 API Key 與 Secret Key；只有其中一個無法登入 Shioaji。")
+    return resolved_api_key, resolved_secret_key
+
+
 def run_colab_dashboard(
-    api_key: str,
-    secret_key: str,
+    api_key: str | None = None,
+    secret_key: str | None = None,
     contract_code: str = DEFAULT_CONTRACT_CODE,
     quote_types: Sequence[str] = DEFAULT_QUOTE_TYPES,
     simulation: bool = True,
     max_rows: int = 30,
 ) -> MicroTaiexDashboard:
-    """Login, resolve a TMF contract, and start the notebook dashboard."""
+    """Prompt when needed, login, resolve a TMF contract, and start the notebook dashboard."""
 
     patch_notebook_event_loop()
-    api = login_api(api_key, secret_key, simulation=simulation, fetch_contract=True)
+    resolved_api_key, resolved_secret_key = prompt_for_shioaji_credentials(api_key, secret_key)
+    api = login_api(resolved_api_key, resolved_secret_key, simulation=simulation, fetch_contract=True)
     contract = resolve_futures_contract(api, contract_code)
     dashboard = MicroTaiexDashboard(api, contract, quote_types=quote_types, max_rows=max_rows)
     return dashboard.start(display_ui=True)
@@ -429,10 +450,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    api_key = os.environ.get("SINOPAC_API_KEY")
-    secret_key = os.environ.get("SINOPAC_SECRET_KEY")
+    api_key = os.environ.get("SINOPAC_API_KEY") or os.environ.get("SJ_API_KEY")
+    secret_key = os.environ.get("SINOPAC_SECRET_KEY") or os.environ.get("SJ_SEC_KEY")
     if not api_key or not secret_key:
-        print("Please set SINOPAC_API_KEY and SINOPAC_SECRET_KEY environment variables.", file=sys.stderr)
+        print(
+            "Please set SINOPAC_API_KEY/SJ_API_KEY and SINOPAC_SECRET_KEY/SJ_SEC_KEY. "
+            "Shioaji login requires both API Key and Secret Key.",
+            file=sys.stderr,
+        )
         return 2
 
     api = login_api(api_key, secret_key, simulation=not args.live, fetch_contract=True)
