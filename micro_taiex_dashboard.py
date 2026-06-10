@@ -75,12 +75,14 @@ class MicroTaiexDashboard:
         quote_types: Sequence[str] = DEFAULT_QUOTE_TYPES,
         max_rows: int = 30,
         refresh_interval: float = 0.5,
+        quote_version: str = "v1",
     ) -> None:
         self.api = api
         self.contract = contract
         self.quote_types = tuple(normalize_quote_type(q) for q in quote_types)
         self.max_rows = max_rows
         self.refresh_interval = refresh_interval
+        self.quote_version = quote_version
         self.records: deque[QuoteRecord] = deque(maxlen=max_rows)
         self.events: queue.Queue[QuoteRecord] = queue.Queue()
         self._lock = threading.RLock()
@@ -96,6 +98,10 @@ class MicroTaiexDashboard:
         self._latest_bid_volume: Any = ""
         self._latest_ask_price: Any = ""
         self._latest_ask_volume: Any = ""
+        self._latest_reference_price: float | None = None
+        self._latest_reference_source = ""
+        self._previous_reference_price: float | None = None
+        self._price_history: deque[tuple[str, float, str]] = deque(maxlen=max_rows)
         self._callback_refs: dict[str, Any] = {}
         self._subscription_errors: list[str] = []
         self._widgets: dict[str, Any] = {}
@@ -109,7 +115,7 @@ class MicroTaiexDashboard:
         self._register_callbacks()
         for quote_type in self.quote_types:
             try:
-                self.api.subscribe(self.contract, quote_type=subscribe_quote_arg(quote_type))
+                self.api.subscribe(self.contract, **subscribe_kwargs(quote_type, self.quote_version))
             except Exception as exc:  # noqa: BLE001 - surface all subscription failures in the UI
                 self._subscription_errors.append(f"{quote_type}: {exc}")
 
@@ -125,7 +131,7 @@ class MicroTaiexDashboard:
         self._stop_event.set()
         for quote_type in self.quote_types:
             try:
-                self.api.unsubscribe(self.contract, quote_type=subscribe_quote_arg(quote_type))
+                self.api.unsubscribe(self.contract, **subscribe_kwargs(quote_type, self.quote_version))
             except Exception as exc:  # noqa: BLE001 - best effort cleanup
                 print(f"unsubscribe {quote_type} failed: {exc}", file=sys.stderr)
         for quote_type in self.quote_types:
@@ -203,6 +209,12 @@ class MicroTaiexDashboard:
             self._latest_ask_price = record.ask_price
             self._latest_ask_volume = record.ask_volume
 
+        reference_price, reference_source = quote_reference_price(record)
+        if reference_price is not None:
+            self._latest_reference_price = reference_price
+            self._latest_reference_source = reference_source
+            self._price_history.append((record.received_at, reference_price, reference_source))
+
     def _display_widgets(self) -> None:
         try:
             import ipywidgets as widgets
@@ -218,14 +230,16 @@ class MicroTaiexDashboard:
         last_price = widgets.HTML("<h1 style='margin:0'>--</h1>")
         meta = widgets.HTML("契約：--　時間：--　量：--")
         bidask = widgets.HTML("買：-- / --　賣：-- / --")
+        change_panel = widgets.HTML("<b>即時價格變化：</b>等待報價...")
         table = widgets.HTML("")
-        box = widgets.VBox([title, status, last_price, meta, bidask, table])
+        box = widgets.VBox([title, status, last_price, meta, bidask, change_panel, table])
         self._widgets.update(
             {
                 "status": status,
                 "last_price": last_price,
                 "meta": meta,
                 "bidask": bidask,
+                "change_panel": change_panel,
                 "table": table,
             }
         )
@@ -245,7 +259,7 @@ class MicroTaiexDashboard:
         self._widgets["status"].value = (
             "<b>狀態：</b>已訂閱，等待第一筆報價...　"
             f"契約：{html.escape(str(contract_code))}　"
-            f"訂閱：{html.escape(', '.join(self.quote_types))}"
+            f"訂閱：{html.escape(', '.join(self.quote_types))}　版本：{html.escape(str(self.quote_version))}"
         )
 
     def _refresh_loop(self) -> None:
@@ -271,26 +285,35 @@ class MicroTaiexDashboard:
             bid_volume = self._latest_bid_volume
             ask_price = self._latest_ask_price
             ask_volume = self._latest_ask_volume
+            reference_price = self._latest_reference_price
+            reference_source = self._latest_reference_source
+            price_history = list(self._price_history)
 
         price = coerce_float(display_close)
+        movement_price = reference_price if reference_price is not None else price
         color = "black"
         arrow = ""
-        if price is not None and self._previous_close is not None:
-            if price > self._previous_close:
+        delta = None
+        if movement_price is not None and self._previous_reference_price is not None:
+            delta = movement_price - self._previous_reference_price
+            if delta > 0:
                 color = "#d62728"
                 arrow = "▲"
-            elif price < self._previous_close:
+            elif delta < 0:
                 color = "#2ca02c"
                 arrow = "▼"
+        if movement_price is not None:
+            self._previous_reference_price = movement_price
         if price is not None:
             self._previous_close = price
 
         self._widgets["status"].value = (
             f"<b>狀態：</b>接收中　最後更新：{html.escape(str(latest.received_at))}　"
-            f"訂閱：{html.escape(', '.join(self.quote_types))}"
+            f"訂閱：{html.escape(', '.join(self.quote_types))}　版本：{html.escape(str(self.quote_version))}"
         )
+        primary_price = display_close if display_close not in (None, "") else format_price(reference_price)
         self._widgets["last_price"].value = (
-            f"<h1 style='margin:0;color:{color}'>{html.escape(str(display_close or '--'))} {arrow}</h1>"
+            f"<h1 style='margin:0;color:{color}'>{html.escape(str(primary_price or '--'))} {arrow}</h1>"
         )
         self._widgets["meta"].value = (
             f"契約：{html.escape(str(display_code or '--'))}　日期：{html.escape(str(display_date or '--'))}　"
@@ -300,7 +323,98 @@ class MicroTaiexDashboard:
             f"買：{html.escape(str(bid_price or '--'))} / {html.escape(str(bid_volume or '--'))}　"
             f"賣：{html.escape(str(ask_price or '--'))} / {html.escape(str(ask_volume or '--'))}"
         )
+        self._widgets["change_panel"].value = render_price_change_panel(
+            trade_price=display_close,
+            reference_price=reference_price,
+            reference_source=reference_source,
+            delta=delta,
+            arrow=arrow,
+            color=color,
+            price_history=price_history,
+        )
         self._widgets["table"].value = render_quote_table(rows)
+
+
+def quote_reference_price(record: QuoteRecord) -> tuple[float | None, str]:
+    """Return a realtime reference price from trade price, bid/ask midpoint, bid, or ask."""
+
+    close = coerce_float(record.close)
+    if close is not None:
+        return close, "成交"
+
+    bid = coerce_float(record.bid_price)
+    ask = coerce_float(record.ask_price)
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2, "買賣中價"
+    if bid is not None:
+        return bid, "最佳買價"
+    if ask is not None:
+        return ask, "最佳賣價"
+    return None, ""
+
+
+def format_price(value: Any) -> str:
+    price = coerce_float(value)
+    if price is None:
+        return ""
+    if price.is_integer():
+        return str(int(price))
+    return f"{price:.2f}"
+
+
+def render_price_change_panel(
+    trade_price: Any,
+    reference_price: float | None,
+    reference_source: str,
+    delta: float | None,
+    arrow: str,
+    color: str,
+    price_history: Sequence[tuple[str, float, str]],
+) -> str:
+    """Render a compact realtime price-change panel with a small sparkline."""
+
+    delta_text = "--" if delta is None else f"{delta:+.2f}"
+    latest_reference = format_price(reference_price) or "--"
+    latest_trade = html.escape(str(trade_price or "--"))
+    source = html.escape(reference_source or "等待報價")
+    sparkline = render_sparkline([point[1] for point in price_history])
+    return (
+        "<div style='border:1px solid #ddd;border-radius:8px;padding:8px;margin:6px 0'>"
+        "<div style='font-weight:700;margin-bottom:4px'>即時價格變化</div>"
+        "<div style='display:flex;gap:18px;align-items:flex-end;flex-wrap:wrap'>"
+        f"<div>參考價<br><span style='font-size:28px;color:{color};font-weight:700'>{html.escape(latest_reference)} {arrow}</span></div>"
+        f"<div>變動<br><span style='font-size:20px;color:{color};font-weight:700'>{html.escape(delta_text)}</span></div>"
+        f"<div>來源<br><span>{source}</span></div>"
+        f"<div>最新成交<br><span>{latest_trade}</span></div>"
+        f"<div style='min-width:220px'>{sparkline}</div>"
+        "</div></div>"
+    )
+
+
+def render_sparkline(values: Sequence[float], width: int = 220, height: int = 54) -> str:
+    if not values:
+        return "<span style='color:#777'>等待價格序列...</span>"
+    if len(values) == 1:
+        y = height / 2
+        points = f"0,{y:.1f} {width},{y:.1f}"
+    else:
+        low = min(values)
+        high = max(values)
+        span = high - low or 1
+        step = width / (len(values) - 1)
+        points = " ".join(
+            f"{idx * step:.1f},{height - ((value - low) / span * (height - 8) + 4):.1f}"
+            for idx, value in enumerate(values)
+        )
+    last = values[-1]
+    first = values[0]
+    stroke = "#d62728" if last > first else "#2ca02c" if last < first else "#555"
+    return (
+        f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+        "style='background:#fafafa;border:1px solid #eee'>"
+        f"<polyline fill='none' stroke='{stroke}' stroke-width='2' points='{points}'/>"
+        "</svg>"
+    )
 
 
 def render_quote_table(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -363,6 +477,7 @@ def run_colab_dashboard(
     quote_types: Sequence[str] = DEFAULT_QUOTE_TYPES,
     simulation: bool = True,
     max_rows: int = 30,
+    quote_version: str = "v1",
 ) -> MicroTaiexDashboard:
     """Prompt when needed, login, resolve a TMF contract, and start the notebook dashboard."""
 
@@ -370,7 +485,7 @@ def run_colab_dashboard(
     resolved_api_key, resolved_secret_key = prompt_for_shioaji_credentials(api_key, secret_key)
     api = login_api(resolved_api_key, resolved_secret_key, simulation=simulation, fetch_contract=True)
     contract = resolve_futures_contract(api, contract_code)
-    dashboard = MicroTaiexDashboard(api, contract, quote_types=quote_types, max_rows=max_rows)
+    dashboard = MicroTaiexDashboard(api, contract, quote_types=quote_types, max_rows=max_rows, quote_version=quote_version)
     return dashboard.start(display_ui=True)
 
 
@@ -402,13 +517,39 @@ def resolve_futures_contract(api: Any, contract_code: str = DEFAULT_CONTRACT_COD
         except Exception:  # noqa: BLE001 - try next contract-tree shape
             continue
         if contract is not None:
-            return contract
+            return resolve_streaming_target_contract(api, contract)
 
     available = list_product_contracts(api, product, print_result=False)
     preview = ", ".join(available[:20]) or "no contracts found"
     raise ValueError(
         f"Cannot resolve futures contract {code!r}. Available {product} contracts: {preview}"
     )
+
+
+def resolve_streaming_target_contract(api: Any, contract: Any) -> Any:
+    """Use the resolved monthly target when a continuous contract exposes target_code."""
+
+    target_code = str(getattr(contract, "target_code", "") or "").upper()
+    source_code = str(getattr(contract, "code", "") or "").upper()
+    if not target_code or target_code == source_code:
+        return contract
+
+    product = target_code[:3]
+    futures = api.Contracts.Futures
+    candidates = [
+        lambda: getattr(getattr(futures, product), target_code),
+        lambda: getattr(futures, product)[target_code],
+        lambda: futures[product][target_code],
+        lambda: futures[target_code],
+    ]
+    for getter in candidates:
+        try:
+            target_contract = getter()
+        except Exception:  # noqa: BLE001 - try next contract-tree shape
+            continue
+        if target_contract is not None:
+            return target_contract
+    return contract
 
 
 def list_product_contracts(api: Any, product: str = "TMF", print_result: bool = True) -> list[str]:
@@ -457,6 +598,24 @@ def subscribe_quote_arg(canonical_quote_type: str) -> Any:
     except ImportError:
         return {"Tick": "tick", "BidAsk": "bid_ask", "Quote": "quote"}[canonical_quote_type]
     return {"Tick": sj.QuoteType.Tick, "BidAsk": sj.QuoteType.BidAsk, "Quote": sj.QuoteType.Quote}[canonical_quote_type]
+
+
+def quote_version_arg(version: str = "v1") -> Any:
+    """Return the quote version accepted by Shioaji; v1 is required for FOP v1 callbacks."""
+
+    if version.lower() != "v1":
+        return version
+    try:
+        import shioaji as sj
+    except ImportError:
+        return version
+    return sj.QuoteVersion.v1
+
+
+def subscribe_kwargs(canonical_quote_type: str, version: str = "v1") -> dict[str, Any]:
+    """Build subscribe/unsubscribe kwargs with quote_type and callback-compatible version."""
+
+    return {"quote_type": subscribe_quote_arg(canonical_quote_type), "version": quote_version_arg(version)}
 
 
 def normalize_quote_type(quote_type: str) -> str:
