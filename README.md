@@ -31,6 +31,7 @@ dashboard = run_colab_dashboard(
   - 最新成交價、成交量、時間、漲跌方向。
   - 最佳買賣價量（若訂閱 BidAsk 或回傳資料包含該欄位）。
   - 最近 N 筆報價表格。
+  - Tick 與 BidAsk 交錯推送時，畫面會保留最新成交價，並持續更新買賣價量；不會因最新一筆是 BidAsk 而把成交價顯示成 `--`。
 - 可用 CLI 在終端機列印即時報價，方便先確認帳號與契約代碼。
 
 ## 快速開始：Google Colab
@@ -39,7 +40,7 @@ dashboard = run_colab_dashboard(
 2. 安裝套件：
 
 ```python
-!pip install -q shioaji ipywidgets pandas nest-asyncio
+!pip install -q shioaji ipywidgets nest-asyncio
 ```
 
 3. 下載或上傳本專案的 `micro_taiex_dashboard.py`，然後執行：

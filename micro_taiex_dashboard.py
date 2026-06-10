@@ -8,6 +8,7 @@ as a CLI to print incoming quotes in a terminal.
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import queue
 import signal
@@ -82,9 +83,19 @@ class MicroTaiexDashboard:
         self.refresh_interval = refresh_interval
         self.records: deque[QuoteRecord] = deque(maxlen=max_rows)
         self.events: queue.Queue[QuoteRecord] = queue.Queue()
+        self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._ui_thread: threading.Thread | None = None
         self._previous_close: float | None = None
+        self._latest_close: Any = ""
+        self._latest_volume: Any = ""
+        self._latest_trade_time: Any = ""
+        self._latest_trade_date: Any = ""
+        self._latest_code: Any = ""
+        self._latest_bid_price: Any = ""
+        self._latest_bid_volume: Any = ""
+        self._latest_ask_price: Any = ""
+        self._latest_ask_volume: Any = ""
         self._widgets: dict[str, Any] = {}
 
     def start(self, display_ui: bool = True) -> "MicroTaiexDashboard":
@@ -151,27 +162,45 @@ class MicroTaiexDashboard:
 
     def _handle_quote(self, quote_type: str, payload: Any) -> None:
         record = normalize_quote_payload(quote_type, payload)
-        self.records.appendleft(record)
+        with self._lock:
+            self.records.appendleft(record)
+            self._remember_quote_state(record)
         self.events.put(record)
+        self._render_once()
+
+    def _remember_quote_state(self, record: QuoteRecord) -> None:
+        """Keep the latest trade and bid/ask values across mixed quote events."""
+
+        if record.code:
+            self._latest_code = record.code
+        if record.close not in (None, ""):
+            self._latest_close = record.close
+            self._latest_trade_time = record.time
+            self._latest_trade_date = record.date
+            self._latest_volume = record.volume
+        if record.bid_price not in (None, ""):
+            self._latest_bid_price = record.bid_price
+            self._latest_bid_volume = record.bid_volume
+        if record.ask_price not in (None, ""):
+            self._latest_ask_price = record.ask_price
+            self._latest_ask_volume = record.ask_volume
 
     def _display_widgets(self) -> None:
         try:
-            import pandas as pd
             import ipywidgets as widgets
             from IPython.display import display
         except ImportError as exc:  # pragma: no cover - depends on notebook env
             raise RuntimeError(
-                "Dashboard UI requires ipywidgets, pandas, and IPython. "
-                "Install with: pip install ipywidgets pandas"
+                "Dashboard UI requires ipywidgets and IPython. "
+                "Install with: pip install ipywidgets"
             ) from exc
 
-        self._widgets["pd"] = pd
         title = widgets.HTML("<h2>微型臺指期貨（TMF）即時報價</h2>")
         status = widgets.HTML("<b>狀態：</b>已訂閱，等待報價...")
         last_price = widgets.HTML("<h1 style='margin:0'>--</h1>")
         meta = widgets.HTML("契約：--　時間：--　量：--")
         bidask = widgets.HTML("買：-- / --　賣：-- / --")
-        table = widgets.Output()
+        table = widgets.HTML("")
         box = widgets.VBox([title, status, last_price, meta, bidask, table])
         self._widgets.update(
             {
@@ -190,12 +219,25 @@ class MicroTaiexDashboard:
             time.sleep(self.refresh_interval)
 
     def _render_once(self) -> None:
-        if not self.records or not self._widgets:
+        if not self._widgets:
             return
 
-        pd = self._widgets["pd"]
-        latest = self.records[0]
-        price = coerce_float(latest.close)
+        with self._lock:
+            if not self.records:
+                return
+            latest = self.records[0]
+            rows = [record.as_row() for record in self.records]
+            display_close = self._latest_close
+            display_volume = self._latest_volume
+            display_code = self._latest_code or latest.code
+            display_date = self._latest_trade_date or latest.date
+            display_time = self._latest_trade_time or latest.time
+            bid_price = self._latest_bid_price
+            bid_volume = self._latest_bid_volume
+            ask_price = self._latest_ask_price
+            ask_volume = self._latest_ask_volume
+
+        price = coerce_float(display_close)
         color = "black"
         arrow = ""
         if price is not None and self._previous_close is not None:
@@ -209,27 +251,44 @@ class MicroTaiexDashboard:
             self._previous_close = price
 
         self._widgets["status"].value = (
-            f"<b>狀態：</b>接收中　最後更新：{latest.received_at}　"
-            f"訂閱：{', '.join(self.quote_types)}"
+            f"<b>狀態：</b>接收中　最後更新：{html.escape(str(latest.received_at))}　"
+            f"訂閱：{html.escape(', '.join(self.quote_types))}"
         )
         self._widgets["last_price"].value = (
-            f"<h1 style='margin:0;color:{color}'>{latest.close or '--'} {arrow}</h1>"
+            f"<h1 style='margin:0;color:{color}'>{html.escape(str(display_close or '--'))} {arrow}</h1>"
         )
         self._widgets["meta"].value = (
-            f"契約：{latest.code or '--'}　日期：{latest.date or '--'}　"
-            f"時間：{latest.time or '--'}　量：{latest.volume or '--'}"
+            f"契約：{html.escape(str(display_code or '--'))}　日期：{html.escape(str(display_date or '--'))}　"
+            f"時間：{html.escape(str(display_time or '--'))}　量：{html.escape(str(display_volume or '--'))}"
         )
         self._widgets["bidask"].value = (
-            f"買：{latest.bid_price or '--'} / {latest.bid_volume or '--'}　"
-            f"賣：{latest.ask_price or '--'} / {latest.ask_volume or '--'}"
+            f"買：{html.escape(str(bid_price or '--'))} / {html.escape(str(bid_volume or '--'))}　"
+            f"賣：{html.escape(str(ask_price or '--'))} / {html.escape(str(ask_volume or '--'))}"
         )
-        dataframe = pd.DataFrame([record.as_row() for record in self.records])
-        output = self._widgets["table"]
-        output.clear_output(wait=True)
-        with output:
-            from IPython.display import display
+        self._widgets["table"].value = render_quote_table(rows)
 
-            display(dataframe)
+
+def render_quote_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Render quote rows as a single HTML value so Colab keeps refreshing it."""
+
+    columns = ["received_at", "type", "code", "date", "time", "close", "volume", "bid", "bid_vol", "ask", "ask_vol"]
+    header = "".join(f"<th>{html.escape(column)}</th>" for column in columns)
+    body_rows = []
+    for row in rows:
+        cells = "".join(f"<td>{html.escape(str(row.get(column, '') or ''))}</td>" for column in columns)
+        body_rows.append(f"<tr>{cells}</tr>")
+    body = "".join(body_rows)
+    return (
+        "<div style='max-height:420px;overflow:auto'>"
+        "<table style='border-collapse:collapse;font-family:monospace;font-size:12px'>"
+        "<thead><tr>"
+        f"{header}"
+        "</tr></thead>"
+        f"<tbody>{body}</tbody>"
+        "</table></div>"
+        "<style>td,th{border:1px solid #ddd;padding:3px 6px;text-align:right}"
+        "th{background:#f6f6f6;position:sticky;top:0}</style>"
+    )
 
 
 def login_api(api_key: str, secret_key: str, simulation: bool = True, fetch_contract: bool = True) -> Any:
